@@ -313,7 +313,7 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
     end
 
     #@logger.info("Opening file", :path => path)
-
+    
     dir = File.dirname(path)
     if !Dir.exist?(dir)
       @logger.info("Creating directory", :directory => dir)
