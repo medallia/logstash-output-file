@@ -3,6 +3,7 @@ require "logstash/namespace"
 require "logstash/outputs/base"
 require "logstash/errors"
 require "zlib"
+require "java"
 
 # This output writes events to files on disk. You can use fields
 # from the event as parts of the filename and/or path.
@@ -18,7 +19,43 @@ require "zlib"
 # }
 class LogStash::Outputs::File < LogStash::Outputs::Base
   concurrency :shared
-  
+
+  class CloseTask
+    include Java::JavaUtilConcurrent::Callable
+
+    def initialize(path, fd, latch)
+      @fd = fd
+      @path = path
+      @latch = latch
+    end
+
+    def call
+      puts("Before closing file" + @path)
+      now = Time.now
+      #@logger.info("Closing file %s" % @path)
+      #@fd.close
+      puts("Closing file" + @path + " time taken:" + (Time.now - now).to_s)
+      @latch.countDown()
+    end
+  end
+
+  class Task
+    include Java::JavaUtilConcurrent::Callable
+
+    def initialize(path, fd, latch)
+      @fd = fd
+      @path = path
+      @latch = latch
+    end
+
+    def call
+      #@logger.debug("Flushing file", :path => @path, :fd => @fd)
+      #now = Time.now
+      @fd.flush
+      @latch.countDown()
+    end
+  end
+
   FIELD_REF = /%\{[^}]+\}/
 
   config_name "file"
@@ -48,7 +85,7 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
   # into this file and inside the defined path.
   config :filename_failure, :validate => :string, :default => '_filepath_failures'
 
-  # If the configured file is deleted, but an event is handled by the plugin, 
+  # If the configured file is deleted, but an event is handled by the plugin,
   # the plugin will recreate the file. Default => true
   config :create_if_deleted, :validate => :boolean, :default => true
 
@@ -64,7 +101,6 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
   # Example: `"file_mode" => 0640`
   config :file_mode, :validate => :number, :default => -1
 
-
   # How should the file be written?
   #
   # If `append`, the file will be opened for appending and each new event will
@@ -74,6 +110,12 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
   # recent event will appear in the file.
   config :write_behavior, :validate => [ "overwrite", "append" ], :default => "append"
 
+  ###################################
+  # Medallia extended configuration
+  config :stale_cleanup_interval, :validate => :number, :default => 10
+
+  config :num_threads_flush, :validate => :number, :default => 10
+
   default :codec, "json_lines"
 
   public
@@ -82,7 +124,7 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
 
     @files = {}
     @io_mutex = Mutex.new
-    
+
     @path = File.expand_path(path)
 
     validate_path
@@ -99,7 +141,8 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
     @last_flush_cycle = now
     @last_stale_cleanup_cycle = now
     @flush_interval = @flush_interval.to_i
-    @stale_cleanup_interval = 10
+    #@stale_cleanup_interval = 10
+    @executor = java.util.concurrent.Executors.newFixedThreadPool(@num_threads_flush)
   end # def register
 
   private
@@ -143,16 +186,16 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
         end
         fd.flush
       end
-      
+
       close_stale_files
-    end   
+    end
   end # def receive
 
   public
   def close
     @io_mutex.synchronize do
       @logger.debug("Close: closing files")
-      
+
       @files.each do |path, fd|
         begin
           fd.close
@@ -180,8 +223,8 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
       file_output_path = @failure_path
     end
     @logger.debug("File, writing event to file.", :filename => file_output_path)
-    
-    file_output_path    
+
+    file_output_path
   end
 
   private
@@ -214,12 +257,13 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
   def flush_pending_files
     return unless Time.now - @last_flush_cycle >= flush_interval
     @logger.debug("Starting flush cycle")
-
+    latch = java.util.concurrent.CountDownLatch.new(@files.size);
     @files.each do |path, fd|
       @logger.debug("Flushing file", :path => path, :fd => fd)
-      fd.flush
+      #fd.flush
+      @executor.submit Task.new(path, fd, latch)
     end
-    
+    latch.await()
     @last_flush_cycle = Time.now
   end
 
@@ -233,7 +277,7 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
     inactive_files = @files.select { |path, fd| not fd.active }
     @logger.debug("%d stale files found" % inactive_files.count, :inactive_files => inactive_files)
     inactive_files.each do |path, fd|
-      @logger.info("Closing file %s" % path)
+      #@logger.info("Closing file %s" % path)
       fd.close
       @files.delete(path)
     end
@@ -267,8 +311,8 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
       end
     end
 
-    @logger.info("Opening file", :path => path)
-    
+    #@logger.info("Opening file", :path => path)
+
     dir = File.dirname(path)
     if !Dir.exist?(dir)
       @logger.info("Creating directory", :directory => dir)
@@ -278,7 +322,7 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
         FileUtils.mkdir_p(dir)
       end
     end
-    
+
     # work around a bug opening fifos (bug JRUBY-6280)
     stat = File.stat(path) rescue nil
     if stat && stat.ftype == "fifo" && LogStash::Environment.jruby?
