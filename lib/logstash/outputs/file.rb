@@ -3,6 +3,7 @@ require "logstash/namespace"
 require "logstash/outputs/base"
 require "logstash/errors"
 require "zlib"
+require "java"
 
 # This output writes events to files on disk. You can use fields
 # from the event as parts of the filename and/or path.
@@ -18,6 +19,42 @@ require "zlib"
 # }
 class LogStash::Outputs::File < LogStash::Outputs::Base
   concurrency :shared
+
+  class CloseTask
+    include Java::JavaUtilConcurrent::Callable
+
+    def initialize(path, fd, latch)
+      @fd = fd
+      @path = path
+      @latch = latch
+    end
+
+    def call
+      puts("Before closing file" + @path)
+      now = Time.now
+      #@logger.info("Closing file %s" % @path)
+      #@fd.close
+      puts("Closing file" + @path + " time taken:" + (Time.now - now).to_s)
+      @latch.countDown()
+    end
+  end
+
+  class Task
+    include Java::JavaUtilConcurrent::Callable
+
+    def initialize(path, fd, latch)
+      @fd = fd
+      @path = path
+      @latch = latch
+    end
+
+    def call
+      #@logger.debug("Flushing file", :path => @path, :fd => @fd)
+      #now = Time.now
+      @fd.flush
+      @latch.countDown()
+    end
+  end
   
   FIELD_REF = /%\{[^}]+\}/
 
@@ -64,6 +101,10 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
   # Example: `"file_mode" => 0640`
   config :file_mode, :validate => :number, :default => -1
 
+  config :stale_cleanup_interval, :validate => :number, :default => 10
+
+  config :num_threads_flush, :validate => :number, :default => 10
+
   default :codec, "json_lines"
 
   public
@@ -89,7 +130,8 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
     @last_flush_cycle = now
     @last_stale_cleanup_cycle = now
     @flush_interval = @flush_interval.to_i
-    @stale_cleanup_interval = 10
+    #@stale_cleanup_interval = 10
+    @executor = java.util.concurrent.Executors.newFixedThreadPool(@num_threads_flush)
   end # def register
 
   private
@@ -197,12 +239,13 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
   def flush_pending_files
     return unless Time.now - @last_flush_cycle >= flush_interval
     @logger.debug("Starting flush cycle")
-
+    latch = java.util.concurrent.CountDownLatch.new(@files.size);
     @files.each do |path, fd|
       @logger.debug("Flushing file", :path => path, :fd => fd)
-      fd.flush
+      #fd.flush
+      @executor.submit Task.new(path, fd, latch)
     end
-    
+    latch.await()
     @last_flush_cycle = Time.now
   end
 
@@ -216,7 +259,7 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
     inactive_files = @files.select { |path, fd| not fd.active }
     @logger.debug("%d stale files found" % inactive_files.count, :inactive_files => inactive_files)
     inactive_files.each do |path, fd|
-      @logger.info("Closing file %s" % path)
+      #@logger.info("Closing file %s" % path)
       fd.close
       @files.delete(path)
     end
@@ -250,7 +293,7 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
       end
     end
 
-    @logger.info("Opening file", :path => path)
+    #@logger.info("Opening file", :path => path)
     
     dir = File.dirname(path)
     if !Dir.exist?(dir)
