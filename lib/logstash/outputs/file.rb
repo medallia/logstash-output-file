@@ -23,15 +23,19 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
   class FlushTask
     include Java::JavaUtilConcurrent::Callable
 
-    def initialize(path, fd, latch)
+    def initialize(path, fd, latch, logger)
       @fd = fd
       @path = path
       @latch = latch
+      @logger = logger
     end
 
     def call
       @logger.debug("Async flushing file", :path => @path, :fd => @fd)
       @fd.flush
+    rescue Exception => e
+      @logger.error("Exception while flushing file aync", :exception => e, :path => @path, :fd => @fd)
+    ensure
       @latch.countDown()
     end
   end
@@ -234,11 +238,10 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
       latch = java.util.concurrent.CountDownLatch.new(@files.size)
       @files.each do |path, fd|
         @logger.debug("Flushing file", :path => path, :fd => fd)
-        #fd.flush
-        @executor.submit FlushTask.new(path, fd, latch)
+        @executor.submit FlushTask.new(path, fd, latch, @logger)
       end
       latch.await()
-      @logger.debug("All files flushed")
+      @logger.debug("Flush cycle finished")
     end
   rescue => e
     # squash exceptions caught while flushing after logging them
