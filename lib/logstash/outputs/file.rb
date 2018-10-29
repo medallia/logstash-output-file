@@ -34,7 +34,7 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
       @logger.debug("Async flushing file", :path => @path, :fd => @fd)
       @fd.flush
     rescue Exception => e
-      @logger.error("Exception while flushing file aync", :exception => e, :path => @path, :fd => @fd)
+      @logger.error("Exception while flushing file async", :exception => e, :path => @path, :fd => @fd)
     ensure
       @latch.countDown()
     end
